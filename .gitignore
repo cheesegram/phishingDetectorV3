@@ -1,0 +1,42 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+myenv/
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local app/runtime files
+.streamlit/secrets.toml
+*.log
+training_log.txt
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large generated ML artifacts
+trained_models/
+
+# Large local datasets
+datasets/
+
+# Keep source-controlled placeholders if added later
+!trained_models/.gitkeep
+!datasets/.gitkeep
