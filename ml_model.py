@@ -33,12 +33,14 @@ try:
         AutoImageProcessor,
         AutoModel,
         AutoModelForImageClassification,
+        AutoModelForSequenceClassification,
         AutoTokenizer,
     )
 except Exception:
     AutoImageProcessor = None
     AutoModel = None
     AutoModelForImageClassification = None
+    AutoModelForSequenceClassification = None
     AutoTokenizer = None
 
 
@@ -59,6 +61,16 @@ PHISHING_KEYWORDS = {
     "login now",
     "security alert",
     "invoice attached",
+    "verify your identity",
+    "account locked",
+    "payment failed",
+    "update payment",
+    "wire transfer",
+    "gift card",
+    "crypto",
+    "unauthorized",
+    "reset password",
+    "confirm now",
 }
 
 SUSPICIOUS_URL_KEYWORDS = {
@@ -72,6 +84,11 @@ SUSPICIOUS_URL_KEYWORDS = {
     "bank",
     "signin",
     "unlock",
+    "auth",
+    "otp",
+    "password",
+    "recover",
+    "webscr",
 }
 
 PHISHING_PROTOTYPES = [
@@ -94,21 +111,44 @@ _mobilenet_bundle = None
 
 def _get_bert_bundle():
     global _bert_bundle
-    if AutoTokenizer is None or AutoModel is None or torch is None or F is None:
+    if AutoTokenizer is None or torch is None or F is None:
         return None
     if _bert_bundle is None:
-        model_name = "bert-base-uncased"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        model.eval()
+        classifier_model = None
+        encoder_model = None
+        tokenizer = None
 
-        phishing_center = _embed_many(PHISHING_PROTOTYPES, tokenizer, model).mean(dim=0)
-        safe_center = _embed_many(SAFE_PROTOTYPES, tokenizer, model).mean(dim=0)
+        trained_cls_path = os.path.join("trained_models", "bert_email_classifier")
+
+        if AutoModelForSequenceClassification is not None and os.path.isdir(trained_cls_path):
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(trained_cls_path)
+                classifier_model = AutoModelForSequenceClassification.from_pretrained(trained_cls_path)
+                classifier_model.eval()
+            except Exception:
+                classifier_model = None
+                tokenizer = None
+
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+        if AutoModel is not None and classifier_model is None:
+            encoder_model = AutoModel.from_pretrained("bert-base-uncased")
+            encoder_model.eval()
+            phishing_center = _embed_many(PHISHING_PROTOTYPES, tokenizer, encoder_model).mean(dim=0)
+            safe_center = _embed_many(SAFE_PROTOTYPES, tokenizer, encoder_model).mean(dim=0)
+            phishing_center = F.normalize(phishing_center, dim=0)
+            safe_center = F.normalize(safe_center, dim=0)
+        else:
+            phishing_center = None
+            safe_center = None
+
         _bert_bundle = {
             "tokenizer": tokenizer,
-            "model": model,
-            "phishing_center": F.normalize(phishing_center, dim=0),
-            "safe_center": F.normalize(safe_center, dim=0),
+            "encoder_model": encoder_model,
+            "classifier_model": classifier_model,
+            "phishing_center": phishing_center,
+            "safe_center": safe_center,
         }
     return _bert_bundle
 
@@ -148,7 +188,30 @@ def _bert_text_risk(email_text):
         heuristic = min(1.0, sum(1 for k in PHISHING_KEYWORDS if k in email_text.lower()) * 0.14)
         return heuristic, 0.0, 0.0
 
-    embeddings = _embed_many([email_text], bundle["tokenizer"], bundle["model"])
+    classifier_model = bundle.get("classifier_model")
+    if classifier_model is not None:
+        with torch.no_grad():
+            encoded = bundle["tokenizer"](
+                [email_text],
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=256,
+            )
+            logits = classifier_model(**encoded).logits
+            probs = F.softmax(logits, dim=-1)[0]
+
+        # Trained classifier label convention: 0=legitimate, 1=phishing.
+        phishing_prob = float(probs[1].item()) if probs.numel() > 1 else float(probs[0].item())
+        safe_prob = float(probs[0].item()) if probs.numel() > 1 else float(1.0 - phishing_prob)
+        return max(0.0, min(1.0, phishing_prob)), phishing_prob, safe_prob
+
+    encoder_model = bundle.get("encoder_model")
+    if encoder_model is None or bundle.get("phishing_center") is None or bundle.get("safe_center") is None:
+        heuristic = min(1.0, sum(1 for k in PHISHING_KEYWORDS if k in email_text.lower()) * 0.14)
+        return heuristic, 0.0, 0.0
+
+    embeddings = _embed_many([email_text], bundle["tokenizer"], encoder_model)
     if embeddings is None:
         heuristic = min(1.0, sum(1 for k in PHISHING_KEYWORDS if k in email_text.lower()) * 0.14)
         return heuristic, 0.0, 0.0
@@ -222,9 +285,56 @@ def _capture_screenshots(urls, output_dir, max_urls=3):
     if not target_urls:
         return captures
 
+    def _wait_for_render(driver, timeout_seconds=12):
+        """Wait until DOM is complete and page body has visible content."""
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                ready_state = driver.execute_script("return document.readyState")
+                body_exists = driver.execute_script("return !!document.body")
+                body_text_len = driver.execute_script(
+                    "return document.body && document.body.innerText ? document.body.innerText.trim().length : 0"
+                )
+                if ready_state == "complete" and body_exists and body_text_len > 20:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.35)
+        return False
+
+    def _is_likely_blank_screenshot(image_path):
+        if not image_path or not os.path.exists(image_path):
+            return True
+        if Image is None or ImageStat is None:
+            return False
+        try:
+            gray = Image.open(image_path).convert("L")
+            stats = ImageStat.Stat(gray)
+            mean = stats.mean[0]
+            variance = stats.var[0]
+            # Near-uniform pages (all white/all dark) are likely failed or pre-render captures.
+            return variance < 12 and (mean > 235 or mean < 20)
+        except Exception:
+            return False
+
+    def _scroll_page_for_lazy_content(driver):
+        """Scroll through the page to trigger lazy-loaded UI/assets."""
+        try:
+            page_height = driver.execute_script("return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);")
+            if not page_height or page_height <= 0:
+                return
+            steps = [0.25, 0.55, 0.85, 0.45, 0.0]
+            for ratio in steps:
+                y = int(page_height * ratio)
+                driver.execute_script("window.scrollTo(0, arguments[0]);", y)
+                time.sleep(0.4)
+        except Exception:
+            pass
+
     try:
         driver = _start_driver()
-        driver.set_page_load_timeout(20)
+        driver.set_page_load_timeout(30)
+        driver.implicitly_wait(8)
     except WebDriverException as exc:
         for url in target_urls:
             captures.append(
@@ -241,14 +351,34 @@ def _capture_screenshots(urls, output_dir, max_urls=3):
         shot_path = os.path.join(output_dir, f"shot_{idx + 1}.png")
         try:
             driver.get(url)
-            time.sleep(1.2)
+            _wait_for_render(driver, timeout_seconds=12)
+            # Give async resources (fonts/images/client scripts) a moment to paint.
+            time.sleep(1.0)
             driver.save_screenshot(shot_path)
+            retry_note = ""
+
+            if _is_likely_blank_screenshot(shot_path):
+                try:
+                    driver.refresh()
+                    _wait_for_render(driver, timeout_seconds=12)
+                    time.sleep(1.3)
+                    driver.save_screenshot(shot_path)
+                    if _is_likely_blank_screenshot(shot_path):
+                        _scroll_page_for_lazy_content(driver)
+                        _wait_for_render(driver, timeout_seconds=8)
+                        time.sleep(1.0)
+                        driver.save_screenshot(shot_path)
+                        if _is_likely_blank_screenshot(shot_path):
+                            retry_note = "Capture still appears blank after retries"
+                except Exception:
+                    retry_note = "Retry after blank capture failed"
+
             captures.append(
                 {
                     "url": url,
                     "screenshot_path": shot_path,
                     "page_title": (driver.title or "").strip(),
-                    "error": "",
+                    "error": retry_note,
                 }
             )
         except TimeoutException:
@@ -367,9 +497,9 @@ def _risk_band(score):
 
 
 def _classify_email(risk_score, nlp_risk):
-    if risk_score >= 70:
+    if risk_score >= 60:
         return "PHISHING ATTEMPT"
-    if risk_score >= 40:
+    if risk_score >= 30:
         return "SUSPICIOUS EMAIL"
     return "LEGITIMATE EMAIL"
 
@@ -397,8 +527,8 @@ def analyze_email_with_ai(email_text):
     text_lower = email_text.lower()
     bert_prob, phishing_sim, safe_sim = _bert_text_risk(email_text)
     keyword_hits = [token for token in PHISHING_KEYWORDS if token in text_lower]
-    keyword_risk = min(1.0, 0.12 * len(keyword_hits))
-    nlp_risk = min(1.0, 0.75 * bert_prob + 0.25 * keyword_risk)
+    keyword_risk = min(1.0, 0.16 * len(keyword_hits))
+    nlp_risk = min(1.0, 0.70 * bert_prob + 0.30 * keyword_risk)
 
     urls = _extract_urls(email_text)
     url_objects = []
@@ -425,7 +555,7 @@ def analyze_email_with_ai(email_text):
         url_risk_scores.append(combined_url_risk)
         vision_risks.append(vision_result["vision_risk"])
 
-        status = "DANGER" if combined_url_risk >= 0.55 else ("UNSAFE" if combined_url_risk >= 0.75 else "SAFE")
+        status = "DANGER" if combined_url_risk >= 0.75 else ("UNSAFE" if combined_url_risk >= 0.55 else "SAFE")
         short_url = url if len(url) <= 72 else f"{url[:69]}..."
         full_url = url
 
@@ -447,7 +577,7 @@ def analyze_email_with_ai(email_text):
     avg_vision_risk = sum(vision_risks) / len(vision_risks) if vision_risks else 0.1
     url_structure_risk_score = _calc_url_structure_risk_score(urls, url_risk_scores)
 
-    unified_risk = min(1.0, 0.50 * nlp_risk + 0.30 * avg_url_risk + 0.20 * avg_vision_risk)
+    unified_risk = min(1.0, 0.60 * nlp_risk + 0.30 * avg_url_risk + 0.10 * avg_vision_risk)
     risk_score = int(round(unified_risk * 100))
     risk_score = min(98, max(1, risk_score))
 

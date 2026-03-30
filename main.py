@@ -133,6 +133,12 @@ elif st.session_state.step == "results":
         with col1:
             with st.container(border=True):
                 st.markdown("🔗 **EXTRACTED URLs**")
+                overall_classification = str(data.get('classification', data.get('risk_level', ''))).upper()
+                email_is_hard_flagged = (
+                    data.get('risk_score', 0) >= 60
+                    or "PHISHING" in overall_classification
+                    or "DANGER" in overall_classification
+                )
                 
                 if not data['extracted_urls']:
                     st.markdown("<p style='color: #888; font-size: 14px;'>No URLs found in email.</p>", unsafe_allow_html=True)
@@ -147,12 +153,12 @@ elif st.session_state.step == "results":
                         
                         col_url, col_status = st.columns([3, 1])
                         with col_url:
-                            if url_obj['status'] == "SAFE":
+                            if url_obj['status'] == "SAFE" and not email_is_hard_flagged:
                                 st.markdown(
                                     f"<a href='{full_url}' target='_blank' style='color: #00ff00; text-decoration: underline; word-break: break-all;'>{i+1}. {url_obj['url']}</a>",
                                     unsafe_allow_html=True
                                 )
-                            elif url_obj['status'] == "DANGER":
+                            elif url_obj['status'] == "DANGER" or email_is_hard_flagged:
                                 st.markdown(
                                     f"<span style='color: #888; word-break: break-all;'>{i+1}. {danger_plain_text}</span>",
                                     unsafe_allow_html=True
