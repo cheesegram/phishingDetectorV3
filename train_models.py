@@ -9,6 +9,8 @@ import os
 import glob
 import json
 import time
+import argparse
+import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -32,7 +34,8 @@ from tqdm import tqdm
 
 
 DATASET_DIR = Path("datasets")
-EMAIL_DATASETS = [
+DEFAULT_EMAIL_DATASET = "training_data/new_training_data.csv"
+LEGACY_EMAIL_DATASETS = [
     "phishing_email_datasets/enron_phishing_and_legitimate_email_dataset.csv",
     "phishing_email_datasets/ling_phishing_and_legitimate_email_dataset.csv",
     "phishing_email_datasets/spam_assassin_phishing_and_legitimate_email_dataset.csv",
@@ -54,6 +57,17 @@ PHASE_WEIGHTS = {
     "url": 20.0,
     "vision": 10.0,
 }
+
+
+def ensure_transformers_datasets_compat():
+    """Ensure transformers can safely reference `datasets.Dataset`.
+
+    In this repo, a local `datasets/` directory may shadow the Hugging Face
+    package name. Trainer only needs this attribute for an `isinstance` check.
+    """
+    ds_module = sys.modules.get("datasets")
+    if ds_module is not None and not hasattr(ds_module, "Dataset"):
+        ds_module.Dataset = type("Dataset", (), {})
 
 
 def _new_progress_state():
@@ -151,14 +165,40 @@ def get_latest_checkpoint(checkpoint_root):
 
 
 def load_email_datasets():
-    """Load and combine all email datasets."""
+    """Load and combine email datasets.
+
+    Default behavior:
+    - Use datasets/training_data/new_training_data.csv when available.
+    - Fallback to legacy datasets if the default file is missing.
+    """
     print("Loading email datasets...")
     dfs = []
-    for email_file in EMAIL_DATASETS:
+
+    default_path = DATASET_DIR / DEFAULT_EMAIL_DATASET
+    email_sources = [DEFAULT_EMAIL_DATASET] if default_path.exists() else LEGACY_EMAIL_DATASETS
+
+    if default_path.exists():
+        print(f"  [OK] Using default email dataset: {DEFAULT_EMAIL_DATASET}")
+    else:
+        print("  [WARN] Default email dataset not found, falling back to legacy email datasets")
+
+    for email_file in email_sources:
         path = DATASET_DIR / email_file
         if path.exists():
             try:
-                df = pd.read_csv(path, usecols=["subject", "body", "label"], low_memory=False)
+                df = pd.read_csv(path, low_memory=False, encoding="utf-8-sig")
+                df.columns = [str(c).strip().lower().lstrip("\ufeff") for c in df.columns]
+
+                if "body" not in df.columns or "label" not in df.columns:
+                    raise ValueError("CSV must contain at least 'body' and 'label' columns")
+
+                if "subject" not in df.columns:
+                    # If subject is missing, derive it from the first line of body.
+                    df["subject"] = df["body"].fillna("").astype(str).apply(
+                        lambda text: next((line.strip() for line in text.splitlines() if line.strip()), "")[:120]
+                    )
+
+                df = df[["subject", "body", "label"]]
                 df["label"] = pd.to_numeric(df["label"], errors="coerce").fillna(0).astype(int)
                 df = df.dropna(subset=["subject", "body"])
                 df["text"] = df["subject"].fillna("") + " " + df["body"].fillna("")
@@ -251,7 +291,7 @@ class EmailDataset(Dataset):
         }
 
 
-def train_email_classifier(df_emails, epochs=1, batch_size=32):
+def train_email_classifier(df_emails, epochs=1, batch_size=32, resume_from_checkpoint=True):
     """Fine-tune BERT for email phishing classification."""
     print("\n" + "="*70)
     print("FINE-TUNING BERT ON EMAIL DATASET")
@@ -263,12 +303,15 @@ def train_email_classifier(df_emails, epochs=1, batch_size=32):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
     
+    text_values = df_emails["text"].astype(str).to_numpy()
+    label_values = df_emails["label"].astype(int).to_numpy()
+
     texts_train, texts_test, labels_train, labels_test = train_test_split(
-        df_emails["text"].values,
-        df_emails["label"].values,
+        text_values,
+        label_values,
         test_size=0.2,
         random_state=42,
-        stratify=df_emails["label"].values,
+        stratify=label_values,
     )
     
     train_dataset = EmailDataset(texts_train, labels_train, tokenizer)
@@ -296,7 +339,9 @@ def train_email_classifier(df_emails, epochs=1, batch_size=32):
     )
     
     checkpoint_root = MODELS_DIR / "bert_email_checkpoint"
-    latest_checkpoint = get_latest_checkpoint(checkpoint_root)
+    latest_checkpoint = get_latest_checkpoint(checkpoint_root) if resume_from_checkpoint else None
+
+    ensure_transformers_datasets_compat()
 
     print("Starting training...")
     if latest_checkpoint is not None:
@@ -304,6 +349,8 @@ def train_email_classifier(df_emails, epochs=1, batch_size=32):
         set_phase_progress("bert", status="running", detail=f"Resuming from {latest_checkpoint.name}")
         trainer.train(resume_from_checkpoint=str(latest_checkpoint))
     else:
+        if not resume_from_checkpoint:
+            print("[OK] Starting fresh BERT training (checkpoint resume disabled)")
         trainer.train()
     
     model_save_path = MODELS_DIR / "bert_email_classifier"
@@ -495,12 +542,20 @@ def train_vision_classifier(image_paths):
 
 
 def main():
-    write_progress(lambda s: s.update(_new_progress_state()))
+    parser = argparse.ArgumentParser(description="Train phishing detection models.")
+    parser.add_argument(
+        "--force-bert-retrain",
+        action="store_true",
+        help="Retrain BERT even if an existing trained model is found.",
+    )
+    args = parser.parse_args()
+
+    write_progress(lambda s: (s.update(_new_progress_state()), s.pop("error", None)))
     print("\n" + "="*70)
     print("PHISHING DETECTOR - COMPREHENSIVE MODEL TRAINING PIPELINE")
     print("="*70)
 
-    bert_output_exists = (MODELS_DIR / "bert_email_classifier").exists()
+    bert_output_exists = (MODELS_DIR / "bert_email_classifier").exists() and not args.force_bert_retrain
     url_output_exists = (MODELS_DIR / "url_classifier.pkl").exists()
 
     df_emails = load_email_datasets() if not bert_output_exists else None
@@ -513,7 +568,12 @@ def main():
             set_phase_progress("bert", status="completed", percent=100.0, detail="Skipped (already trained)")
             bert_model, bert_tokenizer = None, None
         else:
-            bert_model, bert_tokenizer = train_email_classifier(df_emails, epochs=1, batch_size=32)
+            bert_model, bert_tokenizer = train_email_classifier(
+                df_emails,
+                epochs=1,
+                batch_size=32,
+                resume_from_checkpoint=not args.force_bert_retrain,
+            )
 
         if url_output_exists:
             print("[OK] Skipping URL training (existing model found)")

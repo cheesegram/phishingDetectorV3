@@ -1,12 +1,13 @@
 import json
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 
 PROGRESS_FILE = Path("trained_models") / "training_progress.json"
 LOG_FILE = Path("trained_models") / "milestone_updates.log"
-MILESTONES = [10, 25, 50, 75, 100]
 POLL_SECONDS = 15
+STEP_INTERVAL = 5
 
 
 def ts() -> str:
@@ -30,9 +31,17 @@ def load_progress() -> dict | None:
         return None
 
 
+def parse_bert_step(detail: str) -> tuple[int, int] | tuple[None, None]:
+    # Expected format: "Step X/Y"
+    match = re.search(r"Step\s+(\d+)\s*/\s*(\d+)", str(detail))
+    if not match:
+        return None, None
+    return int(match.group(1)), int(match.group(2))
+
+
 def main() -> None:
-    write_line("Milestone watcher started.")
-    reached = set()
+    write_line(f"Step watcher started (interval={STEP_INTERVAL}).")
+    reached_steps = set()
     last_status = None
 
     while True:
@@ -43,15 +52,21 @@ def main() -> None:
 
         overall = float(state.get("overall_percent", 0.0))
         status = str(state.get("status", "running"))
+        bert = state.get("phases", {}).get("bert", {})
+        bert_detail = bert.get("detail", "")
+        current_step, total_steps = parse_bert_step(bert_detail)
 
         if status != last_status:
             write_line(f"Training status: {status}")
             last_status = status
 
-        for m in MILESTONES:
-            if overall >= m and m not in reached:
-                reached.add(m)
-                write_line(f"Milestone reached: {m}% (current: {overall:.2f}%)")
+        if current_step is not None and total_steps is not None:
+            if current_step % STEP_INTERVAL == 0 and current_step not in reached_steps:
+                reached_steps.add(current_step)
+                write_line(
+                    f"BERT step milestone: {current_step}/{total_steps} "
+                    f"(overall: {overall:.2f}%)"
+                )
 
         if status in {"completed", "failed"}:
             if status == "failed":

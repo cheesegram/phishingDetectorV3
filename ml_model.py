@@ -574,10 +574,24 @@ def analyze_email_with_ai(email_text):
         )
 
     avg_url_risk = sum(url_risk_scores) / len(url_risk_scores) if url_risk_scores else 0.05
-    avg_vision_risk = sum(vision_risks) / len(vision_risks) if vision_risks else 0.1
+    avg_vision_risk = sum(vision_risks) / len(vision_risks) if vision_risks else 0.5
     url_structure_risk_score = _calc_url_structure_risk_score(urls, url_risk_scores)
 
-    unified_risk = min(1.0, 0.60 * nlp_risk + 0.30 * avg_url_risk + 0.10 * avg_vision_risk)
+    # Check if vision data is actually available (successful captures).
+    has_successful_vision = any(cap.get("screenshot_path") and os.path.exists(cap.get("screenshot_path")) for cap in captures)
+    
+    # Final risk is primarily NLP + vision; when both agree at high levels, boost confidence.
+    if has_successful_vision:
+        # Use both NLP and vision when vision data exists.
+        base_combined = 0.55 * nlp_risk + 0.45 * avg_vision_risk
+        agreement = 1.0 - abs(nlp_risk - avg_vision_risk)
+        intensity = 0.5 * (nlp_risk + avg_vision_risk)
+        confidence_boost = 0.12 * agreement * intensity
+        unified_risk = min(1.0, base_combined + confidence_boost)
+    else:
+        # No vision data: use NLP risk directly.
+        unified_risk = nlp_risk
+    
     risk_score = int(round(unified_risk * 100))
     risk_score = min(98, max(1, risk_score))
 
@@ -593,6 +607,7 @@ def analyze_email_with_ai(email_text):
         "classification": classification,
         "nlp_findings": nlp_findings,
         "extracted_urls": url_objects,
+        "has_vision_data": has_successful_vision,
         "vision_summary": {
             "avg_vision_risk": round(avg_vision_risk * 100, 2),
             "checked_urls": len(captures),

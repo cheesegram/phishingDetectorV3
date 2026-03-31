@@ -74,14 +74,11 @@ elif st.session_state.step == "results":
                 
                 classification = data.get('classification', data['risk_level'])
                 circle_css = f"""
-                <div style="display: flex; align-items: center; justify-content: space-around; margin-top: 10px;">
+                <div style="display: flex; align-items: center; justify-content: center; margin-top: 10px;">
                     <div style="width: 120px; height: 120px; border-radius: 50%; background: conic-gradient({data['color']} {data['risk_score']}%, #333 0); display: flex; align-items: center; justify-content: center; border: 5px solid #1e232f; margin: 0 auto;">
                         <div class="risk-inner">
                             <span style="font-size: 24px; font-weight: bold; color: {data['color']};">{data['risk_score']}%</span>
                         </div>
-                    </div>
-                    <div>
-                        <h4 style="margin:0; color: white;">{classification}</h4>
                     </div>
                 </div>
                 """
@@ -134,6 +131,7 @@ elif st.session_state.step == "results":
             with st.container(border=True):
                 st.markdown("🔗 **EXTRACTED URLs**")
                 overall_classification = str(data.get('classification', data.get('risk_level', ''))).upper()
+                is_phishing_attempt = "PHISHING ATTEMPT" in overall_classification
                 email_is_hard_flagged = (
                     data.get('risk_score', 0) >= 60
                     or "PHISHING" in overall_classification
@@ -144,8 +142,10 @@ elif st.session_state.step == "results":
                     st.markdown("<p style='color: #888; font-size: 14px;'>No URLs found in email.</p>", unsafe_allow_html=True)
                 else:
                     for i, url_obj in enumerate(data['extracted_urls']):
-                        badge_class = "badge-flagged" if url_obj['status'] == "DANGER" else "badge-safe"
-                        status_text = url_obj['status']
+                        # If email is PHISHING ATTEMPT, all URLs are DANGER.
+                        effective_status = "DANGER" if is_phishing_attempt else url_obj['status']
+                        badge_class = "badge-flagged" if effective_status == "DANGER" else "badge-safe"
+                        status_text = effective_status
                         full_url = url_obj.get('full_url', url_obj['url'])
                         safe_display_url = html.escape(url_obj['url'])
                         # Break auto-link detection for DANGER while keeping visual text readable.
@@ -153,12 +153,12 @@ elif st.session_state.step == "results":
                         
                         col_url, col_status = st.columns([3, 1])
                         with col_url:
-                            if url_obj['status'] == "SAFE" and not email_is_hard_flagged:
+                            if effective_status == "SAFE" and not email_is_hard_flagged:
                                 st.markdown(
                                     f"<a href='{full_url}' target='_blank' style='color: #00ff00; text-decoration: underline; word-break: break-all;'>{i+1}. {url_obj['url']}</a>",
                                     unsafe_allow_html=True
                                 )
-                            elif url_obj['status'] == "DANGER" or email_is_hard_flagged:
+                            elif effective_status == "DANGER" or email_is_hard_flagged or is_phishing_attempt:
                                 st.markdown(
                                     f"<span style='color: #888; word-break: break-all;'>{i+1}. {danger_plain_text}</span>",
                                     unsafe_allow_html=True
