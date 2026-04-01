@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 from PIL import Image
+from sklearn.metrics import precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
@@ -45,7 +46,35 @@ URL_DATASETS = [
     "phishing_url_datasets/mendeley_phishing_url_dataset.csv",
     "phishing_url_datasets/mendeley_legitimate_url_dataset.csv",
 ]
+URL_FEATURE_DATASET = "training_data/new_url_training_data.csv"
+URL_COMPUTABLE_FEATURES = [
+    "Querylength",
+    "domainlength",
+    "pathLength",
+    "urlLen",
+    "tld",
+    "isPortEighty",
+    "NumberofDotsinURL",
+    "ISIpAddressInDomainName",
+    "URL_DigitCount",
+    "host_DigitCount",
+    "Query_DigitCount",
+    "URL_Letter_Count",
+    "host_letter_count",
+    "Query_LetterCount",
+    "NumberRate_URL",
+    "NumberRate_Domain",
+    "SymbolCount_URL",
+    "SymbolCount_Domain",
+    "Entropy_URL",
+    "Entropy_Domain",
+    "URL_sensitiveWord",
+    "URLQueries_variable",
+    "executable",
+]
 IMAGE_DIR = "phishing_website_image_datasets/circl_phishing_website_imageset"
+VISION_PHISHING_SUBDIRS = ["phishing", "malicious", "fake"]
+VISION_LEGIT_SUBDIRS = ["legitimate", "benign", "safe"]
 
 MODELS_DIR = Path("trained_models")
 MODELS_DIR.mkdir(exist_ok=True)
@@ -220,6 +249,54 @@ def load_email_datasets():
 def load_url_datasets():
     """Load and combine all URL datasets."""
     print("\nLoading URL datasets...")
+
+    # Prefer new precomputed feature dataset when available.
+    feature_path = DATASET_DIR / URL_FEATURE_DATASET
+    if feature_path.exists():
+        try:
+            df = pd.read_csv(feature_path, low_memory=False, encoding="utf-8-sig")
+            original_cols = list(df.columns)
+            col_map = {str(c).strip().lower().lstrip("\ufeff"): c for c in original_cols}
+
+            label_key = "url_type_obf_type"
+            if label_key not in col_map:
+                raise ValueError("Missing URL_Type_obf_Type label column")
+
+            raw_labels = df[col_map[label_key]]
+            if pd.api.types.is_numeric_dtype(raw_labels):
+                labels = pd.to_numeric(raw_labels, errors="coerce").fillna(0).astype(int)
+                labels = (labels > 0).astype(int)
+            else:
+                normalized = raw_labels.astype(str).str.strip().str.lower()
+                benign_tokens = {"benign", "legitimate", "safe", "normal", "0", "false"}
+                labels = (~normalized.isin(benign_tokens)).astype(int)
+
+            selected = []
+            for feature in URL_COMPUTABLE_FEATURES:
+                key = feature.lower()
+                if key in col_map:
+                    selected.append(col_map[key])
+
+            if len(selected) < 8:
+                raise ValueError(
+                    f"Insufficient usable feature overlap. Found {len(selected)} of {len(URL_COMPUTABLE_FEATURES)} required features."
+                )
+
+            feature_df = df[selected].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            feature_df.columns = selected
+            feature_df["label"] = labels
+            feature_df = feature_df.dropna(subset=["label"])
+
+            print(f"  [OK] Using feature URL dataset: {URL_FEATURE_DATASET}")
+            print(f"  [OK] Selected computable features: {len(selected)}")
+            print(f"Total URL samples: {len(feature_df)}")
+            print(f"  Phishing (1): {(feature_df['label'] == 1).sum()}")
+            print(f"  Legitimate (0): {(feature_df['label'] == 0).sum()}")
+            return feature_df
+        except Exception as e:
+            print(f"  [WARN] Could not use feature URL dataset ({URL_FEATURE_DATASET}): {e}")
+            print("  [WARN] Falling back to legacy URL datasets")
+
     dfs = []
     for url_file in URL_DATASETS:
         path = DATASET_DIR / url_file
@@ -250,16 +327,52 @@ def load_url_datasets():
 
 
 def load_image_dataset():
-    """Load website screenshots for vision fine-tuning."""
+    """Load website screenshots for vision fine-tuning.
+
+    Preferred layout:
+    datasets/.../circl_phishing_website_imageset/
+      phishing/*.png
+      legitimate/*.png
+    """
     print("\nLoading website images...")
     image_path = DATASET_DIR / IMAGE_DIR
     if not image_path.exists():
         print(f"  [ERROR] Image directory not found: {image_path}")
-        return []
-    
-    pngs = sorted(glob.glob(str(image_path / "*.png")))
-    print(f"  [OK] Found {len(pngs)} PNG images")
-    return pngs
+        return [], []
+
+    image_paths = []
+    labels = []
+
+    # Preferred: class subfolders for phishing(1) and legitimate(0).
+    for subdir in VISION_PHISHING_SUBDIRS:
+        sub_path = image_path / subdir
+        if sub_path.exists() and sub_path.is_dir():
+            pngs = sorted(glob.glob(str(sub_path / "*.png")))
+            image_paths.extend(pngs)
+            labels.extend([1] * len(pngs))
+
+    for subdir in VISION_LEGIT_SUBDIRS:
+        sub_path = image_path / subdir
+        if sub_path.exists() and sub_path.is_dir():
+            pngs = sorted(glob.glob(str(sub_path / "*.png")))
+            image_paths.extend(pngs)
+            labels.extend([0] * len(pngs))
+
+    if image_paths:
+        print(f"  [OK] Labeled PNG images found: {len(image_paths)}")
+        print(f"  Phishing (1): {sum(1 for y in labels if y == 1)}")
+        print(f"  Legitimate (0): {sum(1 for y in labels if y == 0)}")
+        return image_paths, labels
+
+    # Backward compatibility: root-level PNGs exist but no labels.
+    root_pngs = sorted(glob.glob(str(image_path / "*.png")))
+    if root_pngs:
+        print(f"  [WARN] Found {len(root_pngs)} root PNGs but no class subfolders.")
+        print("  [WARN] Vision training requires both phishing and legitimate labeled folders.")
+        return root_pngs, [1] * len(root_pngs)
+
+    print("  [ERROR] No PNG images found")
+    return [], []
 
 
 class EmailDataset(Dataset):
@@ -399,18 +512,26 @@ def train_url_classifier(df_urls):
     
     set_phase_progress("url", status="running", percent=0.0, detail="Extracting URL features")
 
-    extractor = URLFeatureExtractor()
-    total_urls = len(df_urls)
-    feature_rows = []
-    update_every = max(100, total_urls // 100)
-    for idx, url in enumerate(tqdm(df_urls["url"], desc="Extracting features"), start=1):
-        feature_rows.append(extractor.extract_features(url))
-        if idx % update_every == 0 or idx == total_urls:
-            pct = (idx / max(total_urls, 1)) * 70.0
-            set_phase_progress("url", status="running", percent=pct, detail=f"Features {idx}/{total_urls}")
+    extractor = None
+    if "url" in df_urls.columns:
+        extractor = URLFeatureExtractor()
+        total_urls = len(df_urls)
+        feature_rows = []
+        update_every = max(100, total_urls // 100)
+        for idx, url in enumerate(tqdm(df_urls["url"], desc="Extracting features"), start=1):
+            feature_rows.append(extractor.extract_features(url))
+            if idx % update_every == 0 or idx == total_urls:
+                pct = (idx / max(total_urls, 1)) * 70.0
+                set_phase_progress("url", status="running", percent=pct, detail=f"Features {idx}/{total_urls}")
 
-    features = np.array(feature_rows)
-    labels = df_urls["label"].values
+        features = np.array(feature_rows)
+        feature_columns = None
+        labels = df_urls["label"].values
+    else:
+        feature_columns = [c for c in df_urls.columns if c != "label"]
+        features = df_urls[feature_columns].astype(np.float32).to_numpy()
+        labels = df_urls["label"].astype(int).to_numpy()
+        set_phase_progress("url", status="running", percent=70.0, detail=f"Using {len(feature_columns)} precomputed features")
     
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features)
@@ -434,7 +555,16 @@ def train_url_classifier(df_urls):
     import pickle
     model_path = MODELS_DIR / "url_classifier.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump((clf, scaler, extractor), f)
+        pickle.dump(
+            {
+                "clf": clf,
+                "scaler": scaler,
+                "extractor": extractor,
+                "mode": "legacy_extractor" if extractor is not None else "precomputed",
+                "feature_columns": feature_columns,
+            },
+            f,
+        )
     print(f"[OK] URL classifier saved to {model_path}")
     set_phase_progress("url", status="completed", percent=100.0, detail="Completed")
     
@@ -460,7 +590,7 @@ class ImageDataset(Dataset):
         }
 
 
-def train_vision_classifier(image_paths):
+def train_vision_classifier(image_paths, labels):
     """Fine-tune MobileNetV2 on website screenshots."""
     print("\n" + "="*70)
     print("FINE-TUNING MOBILENETV2 ON WEBSITE IMAGES")
@@ -472,8 +602,12 @@ def train_vision_classifier(image_paths):
         print("  [ERROR] No images available for vision training")
         set_phase_progress("vision", status="failed", percent=0.0, detail="No images available")
         return None, None
-    
-    labels = [0] * len(image_paths)
+
+    if len(set(labels)) < 2:
+        print("  [ERROR] Vision dataset must include both phishing and legitimate classes")
+        print("  [HINT] Add PNG files under phishing/ and legitimate/ subfolders")
+        set_phase_progress("vision", status="failed", percent=0.0, detail="Need both phishing and legitimate image classes")
+        return None, None
     
     valid_paths = []
     valid_labels = []
@@ -492,6 +626,11 @@ def train_vision_classifier(image_paths):
         print("  [ERROR] Not enough images for training")
         set_phase_progress("vision", status="failed", percent=0.0, detail="Not enough valid images")
         return None, None
+
+    if len(set(valid_labels)) < 2:
+        print("  [ERROR] After validation, only one class remains")
+        set_phase_progress("vision", status="failed", percent=0.0, detail="Only one class left after image validation")
+        return None, None
     
     model_name = "google/mobilenet_v2_1.0_224"
     processor = AutoImageProcessor.from_pretrained(model_name)
@@ -500,9 +639,11 @@ def train_vision_classifier(image_paths):
         num_labels=2,
         ignore_mismatched_sizes=True,
     )
+    model.config.id2label = {0: "legitimate", 1: "phishing"}
+    model.config.label2id = {"legitimate": 0, "phishing": 1}
     
     paths_train, paths_test, labels_train, labels_test = train_test_split(
-        valid_paths, valid_labels, test_size=0.2, random_state=42
+        valid_paths, valid_labels, test_size=0.2, random_state=42, stratify=valid_labels
     )
     
     train_dataset = ImageDataset(paths_train, labels_train, processor)
@@ -529,9 +670,22 @@ def train_vision_classifier(image_paths):
         eval_dataset=test_dataset,
         callbacks=[TrainingProgressCallback("vision")],
     )
+
+    ensure_transformers_datasets_compat()
     
     print("Starting vision model training...")
     trainer.train()
+
+    # Summarize phishing-class metrics on held-out validation split.
+    eval_output = trainer.predict(test_dataset)
+    y_true = np.array(labels_test)
+    y_pred = np.argmax(eval_output.predictions, axis=1)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", pos_label=1, zero_division=0
+    )
+    print(f"  Vision phishing precision: {precision:.4f}")
+    print(f"  Vision phishing recall:    {recall:.4f}")
+    print(f"  Vision phishing F1:        {f1:.4f}")
     
     model_save_path = MODELS_DIR / "mobilenet_vision_classifier"
     model.save_pretrained(model_save_path)
@@ -548,6 +702,11 @@ def main():
         action="store_true",
         help="Retrain BERT even if an existing trained model is found.",
     )
+    parser.add_argument(
+        "--force-url-retrain",
+        action="store_true",
+        help="Retrain URL classifier even if an existing model is found.",
+    )
     args = parser.parse_args()
 
     write_progress(lambda s: (s.update(_new_progress_state()), s.pop("error", None)))
@@ -556,11 +715,11 @@ def main():
     print("="*70)
 
     bert_output_exists = (MODELS_DIR / "bert_email_classifier").exists() and not args.force_bert_retrain
-    url_output_exists = (MODELS_DIR / "url_classifier.pkl").exists()
+    url_output_exists = (MODELS_DIR / "url_classifier.pkl").exists() and not args.force_url_retrain
 
     df_emails = load_email_datasets() if not bert_output_exists else None
     df_urls = load_url_datasets() if not url_output_exists else None
-    image_paths = load_image_dataset()
+    image_paths, image_labels = load_image_dataset()
     
     try:
         if bert_output_exists:
@@ -582,7 +741,7 @@ def main():
         else:
             url_clf, url_scaler, url_extractor = train_url_classifier(df_urls)
 
-        vision_model, vision_processor = train_vision_classifier(image_paths)
+        vision_model, vision_processor = train_vision_classifier(image_paths, image_labels)
 
         write_progress(lambda s: (s.update({"status": "completed"}), s.pop("error", None)))
     except Exception as exc:

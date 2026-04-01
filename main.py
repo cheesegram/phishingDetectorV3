@@ -137,81 +137,91 @@ elif st.session_state.step == "results":
                     or "PHISHING" in overall_classification
                     or "DANGER" in overall_classification
                 )
-                
-                if not data['extracted_urls']:
-                    st.markdown("<p style='color: #888; font-size: 14px;'>No URLs found in email.</p>", unsafe_allow_html=True)
-                else:
-                    for i, url_obj in enumerate(data['extracted_urls']):
-                        # If email is PHISHING ATTEMPT, all URLs are DANGER.
-                        effective_status = "DANGER" if is_phishing_attempt else url_obj['status']
-                        badge_class = "badge-flagged" if effective_status == "DANGER" else "badge-safe"
-                        status_text = effective_status
-                        full_url = url_obj.get('full_url', url_obj['url'])
-                        safe_display_url = html.escape(url_obj['url'])
-                        # Break auto-link detection for DANGER while keeping visual text readable.
-                        danger_plain_text = safe_display_url.replace("://", "://&#8203;").replace(".", ".&#8203;")
-                        
-                        col_url, col_status = st.columns([3, 1])
-                        with col_url:
-                            if effective_status == "SAFE" and not email_is_hard_flagged:
-                                st.markdown(
-                                    f"<a href='{full_url}' target='_blank' style='color: #00ff00; text-decoration: underline; word-break: break-all;'>{i+1}. {url_obj['url']}</a>",
-                                    unsafe_allow_html=True
-                                )
-                            elif effective_status == "DANGER" or email_is_hard_flagged or is_phishing_attempt:
-                                st.markdown(
-                                    f"<span style='color: #888; word-break: break-all;'>{i+1}. {danger_plain_text}</span>",
-                                    unsafe_allow_html=True
-                                )
-                            else:
-                                st.markdown(
-                                    f"<span style='color: #888; text-decoration: line-through; word-break: break-all;'>{i+1}. {url_obj['url']}</span>",
-                                    unsafe_allow_html=True
-                                )
-                        with col_status:
-                            st.markdown(f"<span class='{badge_class}' style='display: inline-block;'>{status_text}</span>", unsafe_allow_html=True)
+
+                with st.container(height=181):
+                    if not data['extracted_urls']:
+                        st.markdown("<p style='color: #888; font-size: 14px;'>No URLs found in email.</p>", unsafe_allow_html=True)
+                    else:
+                        for i, url_obj in enumerate(data['extracted_urls']):
+                            # If email is PHISHING ATTEMPT, all URLs are DANGER.
+                            effective_status = "DANGER" if is_phishing_attempt else url_obj['status']
+                            badge_class = "badge-flagged" if effective_status == "DANGER" else "badge-safe"
+                            status_text = effective_status
+                            full_url = url_obj.get('full_url', url_obj['url'])
+                            safe_display_url = html.escape(url_obj['url'])
+                            # Break auto-link detection for DANGER while keeping visual text readable.
+                            danger_plain_text = safe_display_url.replace("://", "://&#8203;").replace(".", ".&#8203;")
+
+                            col_url, col_status = st.columns([3, 1])
+                            with col_url:
+                                if effective_status == "SAFE" and not email_is_hard_flagged:
+                                    st.markdown(
+                                        f"<a href='{full_url}' target='_blank' style='color: #00ff00; text-decoration: underline; word-break: break-all;'>{i+1}. {url_obj['url']}</a>",
+                                        unsafe_allow_html=True
+                                    )
+                                elif effective_status == "DANGER" or email_is_hard_flagged or is_phishing_attempt:
+                                    st.markdown(
+                                        f"<span style='color: #888; word-break: break-all;'>{i+1}. {danger_plain_text}</span>",
+                                        unsafe_allow_html=True
+                                    )
+                                else:
+                                    st.markdown(
+                                        f"<span style='color: #888; text-decoration: line-through; word-break: break-all;'>{i+1}. {url_obj['url']}</span>",
+                                        unsafe_allow_html=True
+                                    )
+                            with col_status:
+                                st.markdown(f"<span class='{badge_class}' style='display: inline-block;'>{status_text}</span>", unsafe_allow_html=True)
 
         with col2:
             with st.container(border=True):
                 st.markdown("👁️ **VISION ANALYSIS**")
                 vision_summary = data.get('vision_summary', {})
-                similarity = vision_summary.get('similarity', 50)
+                avg_vision_risk = vision_summary.get('avg_vision_risk', 0)
 
-                screenshot_path = None
-                screenshot_caption = "Screenshot"
-                vision_caption = "Brand Match"
-                phishing_label = "LINKED WEBSITE"
-                legitimate_label = "KNOWN LEGITIMATE WEBSITE"
-                
-                for url_obj in data.get('extracted_urls', []):
-                    if url_obj.get('screenshot_path'):
-                        screenshot_path = url_obj.get('screenshot_path')
-                        if url_obj.get('status') == 'DANGER' or url_obj.get('status') == 'UNSAFE':
-                            phishing_label = "PHISHING WEBSITE"
-                            legitimate_label = url_obj.get('page_title') or "KNOWN LEGITIMATE WEBSITE"
-                        break
+                captured_items = [
+                    obj for obj in data.get('extracted_urls', []) if obj.get('screenshot_path')
+                ]
 
-                if screenshot_path:
-                    similarity_description = "very low" if similarity < 20 else "low" if similarity < 40 else "moderate" if similarity < 70 else "high"
-                    match_color = "#ff4b4b" if similarity < 40 else "#ffd43b" if similarity < 70 else "#00ff00"
-                    st.markdown(
-                        f"<p style='font-size: 12px; color: {match_color};'><em>Match: {similarity}% ({similarity_description})</em></p>",
-                        unsafe_allow_html=True
-                    )
+                if captured_items:
+                    carousel_key = "vision_carousel_index"
+                    if carousel_key not in st.session_state:
+                        st.session_state[carousel_key] = 0
 
-                img_col1, img_col2, img_col3 = st.columns([2, 1, 2])
-                with img_col1:
-                    if screenshot_path:
-                        st.image(screenshot_path, caption=phishing_label)
-                    else:
-                        st.image("https://via.placeholder.com/150x100/1e232f/ffffff?text=Image+1", caption=phishing_label)
-                with img_col2:
-                    st.markdown("<h3 style='text-align:center; margin-top:20px;'>VS</h3>", unsafe_allow_html=True)
-                with img_col3:
-                    if screenshot_path:
-                        st.image(screenshot_path, caption=legitimate_label)
-                    else:
-                        st.image("https://via.placeholder.com/150x100/1e232f/ffffff?text=Image+2", caption=legitimate_label)
+                    current_index = st.session_state[carousel_key]
+                    if current_index >= len(captured_items):
+                        current_index = len(captured_items) - 1
+                    if current_index < 0:
+                        current_index = 0
+                    st.session_state[carousel_key] = current_index
+
+                    current_item = captured_items[current_index]
+                    risk_color = "#ff4b4b" if avg_vision_risk >= 60 else "#ffd43b" if avg_vision_risk >= 40 else "#00ff00"
+
+                    with st.container(height=280):
+                        st.markdown(
+                            f"<p style='font-size: 12px; color: {risk_color}; margin-bottom: 6px;'><em>Vision Analysis Score: {avg_vision_risk}%</em> &nbsp; <span style='color: #888;'>({len(captured_items)} screenshots)</span></p>",
+                            unsafe_allow_html=True,
+                        )
+                        nav_left, nav_center, nav_right = st.columns([1, 6, 1], vertical_alignment="center")
+                        with nav_left:
+                            prev_disabled = current_index <= 0
+                            if st.button("◀", key="vision_prev", disabled=prev_disabled, use_container_width=True):
+                                st.session_state[carousel_key] = max(0, current_index - 1)
+                                st.rerun()
+                        with nav_center:
+                            st.image(
+                                current_item['screenshot_path'],
+                                caption=f"Screenshot {current_index + 1} of {len(captured_items)}",
+                                width="content",
+                            )
+                        with nav_right:
+                            next_disabled = current_index >= len(captured_items) - 1
+                            if st.button("▶", key="vision_next", disabled=next_disabled, use_container_width=True):
+                                st.session_state[carousel_key] = min(len(captured_items) - 1, current_index + 1)
+                                st.rerun()
+                else:
+                    with st.container(height=280):
+                        st.markdown("<p style='color: #888; font-size: 14px; text-align: center;'>No screenshot available</p>", unsafe_allow_html=True)
 
     st.write("<br>", unsafe_allow_html=True)
     if st.button("← Analyze Another Email", use_container_width=False):

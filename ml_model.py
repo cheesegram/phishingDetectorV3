@@ -1,5 +1,6 @@
 import math
 import os
+import pickle
 import re
 import tempfile
 import time
@@ -107,6 +108,148 @@ SAFE_PROTOTYPES = [
 
 _bert_bundle = None
 _mobilenet_bundle = None
+_url_model_bundle = None
+
+
+def _shannon_entropy(text):
+    if not text:
+        return 0.0
+    counts = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+    total = float(len(text))
+    entropy = 0.0
+    for c in counts.values():
+        p = c / total
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def _extract_precomputed_like_features(url, feature_columns):
+    parsed = urlparse(url)
+    raw_host = (parsed.netloc or "").split("@")[-1]
+    host = raw_host.split(":")[0].lower()
+    path = parsed.path or ""
+    query = parsed.query or ""
+    url_lower = url.lower()
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    host_labels = [token for token in host.split(".") if token]
+    tld_len = len(host_labels[-1]) if host_labels else 0
+    query_vars = query.count("&") + 1 if query else 0
+    is_ip = 1 if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host) else 0
+
+    url_digit_count = sum(ch.isdigit() for ch in url)
+    host_digit_count = sum(ch.isdigit() for ch in host)
+    query_digit_count = sum(ch.isdigit() for ch in query)
+
+    url_letter_count = sum(ch.isalpha() for ch in url)
+    host_letter_count = sum(ch.isalpha() for ch in host)
+    query_letter_count = sum(ch.isalpha() for ch in query)
+
+    symbol_count_url = sum(not ch.isalnum() for ch in url)
+    symbol_count_domain = sum(not ch.isalnum() for ch in host)
+
+    sensitive_hits = sum(1 for token in SUSPICIOUS_URL_KEYWORDS if token in url_lower)
+    executable = 1 if any(path.lower().endswith(ext) for ext in [".exe", ".bat", ".cmd", ".scr", ".js", ".vbs", ".jar", ".ps1", ".msi"]) else 0
+
+    values = {
+        "querylength": len(query),
+        "domainlength": len(host),
+        "pathlength": len(path),
+        "urllen": len(url),
+        "tld": tld_len,
+        "isporteighty": 1 if port == 80 else 0,
+        "numberofdotsinurl": url.count("."),
+        "isipaddressindomainname": is_ip,
+        "url_digitcount": url_digit_count,
+        "host_digitcount": host_digit_count,
+        "query_digitcount": query_digit_count,
+        "url_letter_count": url_letter_count,
+        "host_letter_count": host_letter_count,
+        "query_lettercount": query_letter_count,
+        "numberrate_url": url_digit_count / max(len(url), 1),
+        "numberrate_domain": host_digit_count / max(len(host), 1),
+        "symbolcount_url": symbol_count_url,
+        "symbolcount_domain": symbol_count_domain,
+        "entropy_url": _shannon_entropy(url_lower),
+        "entropy_domain": _shannon_entropy(host),
+        "url_sensitiveword": sensitive_hits,
+        "urlqueries_variable": query_vars,
+        "executable": executable,
+    }
+
+    return [float(values.get(col.lower(), 0.0)) for col in feature_columns]
+
+
+def _get_url_model_bundle():
+    global _url_model_bundle
+    if _url_model_bundle is not None:
+        return _url_model_bundle
+
+    model_path = os.path.join("trained_models", "url_classifier.pkl")
+    if not os.path.exists(model_path):
+        _url_model_bundle = None
+        return None
+
+    try:
+        with open(model_path, "rb") as f:
+            payload = pickle.load(f)
+
+        # Backward compatibility with old tuple format.
+        if isinstance(payload, tuple) and len(payload) == 3:
+            clf, scaler, extractor = payload
+            payload = {
+                "clf": clf,
+                "scaler": scaler,
+                "extractor": extractor,
+                "mode": "legacy_extractor",
+                "feature_columns": None,
+            }
+
+        if not isinstance(payload, dict):
+            _url_model_bundle = None
+            return None
+
+        if "clf" not in payload or "scaler" not in payload:
+            _url_model_bundle = None
+            return None
+
+        _url_model_bundle = payload
+        return _url_model_bundle
+    except Exception:
+        _url_model_bundle = None
+        return None
+
+
+def _model_url_probability(url):
+    bundle = _get_url_model_bundle()
+    if bundle is None:
+        return None
+
+    try:
+        mode = bundle.get("mode", "legacy_extractor")
+        if mode == "legacy_extractor" and bundle.get("extractor") is not None:
+            feature_row = bundle["extractor"].extract_features(url)
+        elif mode == "precomputed" and bundle.get("feature_columns"):
+            feature_row = _extract_precomputed_like_features(url, bundle["feature_columns"])
+        else:
+            return None
+
+        scaled = bundle["scaler"].transform([feature_row])
+        clf = bundle["clf"]
+        if hasattr(clf, "predict_proba"):
+            probs = clf.predict_proba(scaled)[0]
+            if len(probs) >= 2:
+                return float(probs[1])
+            return float(probs[0])
+        return None
+    except Exception:
+        return None
 
 
 def _get_bert_bundle():
@@ -158,9 +301,14 @@ def _get_mobilenet_bundle():
     if AutoImageProcessor is None or AutoModelForImageClassification is None or torch is None or F is None:
         return None
     if _mobilenet_bundle is None:
-        model_name = "google/mobilenet_v2_1.0_224"
-        processor = AutoImageProcessor.from_pretrained(model_name)
-        model = AutoModelForImageClassification.from_pretrained(model_name)
+        trained_model_path = os.path.join("trained_models", "mobilenet_vision_classifier")
+        if os.path.isdir(trained_model_path):
+            processor = AutoImageProcessor.from_pretrained(trained_model_path)
+            model = AutoModelForImageClassification.from_pretrained(trained_model_path)
+        else:
+            model_name = "google/mobilenet_v2_1.0_224"
+            processor = AutoImageProcessor.from_pretrained(model_name)
+            model = AutoModelForImageClassification.from_pretrained(model_name)
         model.eval()
         _mobilenet_bundle = {"processor": processor, "model": model}
     return _mobilenet_bundle
@@ -263,6 +411,12 @@ def _url_risk(url):
         risk += 0.15
         reasons.append("Unusually long domain")
 
+    model_prob = _model_url_probability(url)
+    if model_prob is not None:
+        # Blend learned classifier output with structural heuristic to improve robustness.
+        risk = min(1.0, 0.65 * model_prob + 0.35 * risk)
+        reasons.append(f"Model URL risk: {int(round(model_prob * 100))}%")
+
     return min(1.0, risk), reasons
 
 
@@ -279,9 +433,9 @@ def _start_driver():
     return webdriver.Chrome(options=options)
 
 
-def _capture_screenshots(urls, output_dir, max_urls=3):
+def _capture_screenshots(urls, output_dir, max_urls=None):
     captures = []
-    target_urls = urls[:max_urls]
+    target_urls = urls if max_urls is None else urls[:max_urls]
     if not target_urls:
         return captures
 
@@ -489,10 +643,10 @@ def _calc_vision_similarity(captures):
 
 
 def _risk_band(score):
-    if score >= 70:
+    if score >= 60:
         return "High Risk", "#ff4b4b"
     if score >= 40:
-        return "Medium Risk", "#ffa500"
+        return "Medium Risk", "#ffd43b"
     return "Low Risk", "#00ff00"
 
 
@@ -538,7 +692,7 @@ def analyze_email_with_ai(email_text):
     os.makedirs(output_dir, exist_ok=True)
 
     capture_map = {}
-    captures = _capture_screenshots(urls, output_dir=output_dir, max_urls=3)
+    captures = _capture_screenshots(urls, output_dir=output_dir, max_urls=None)
     for cap in captures:
         capture_map[cap["url"]] = cap
 
@@ -551,7 +705,7 @@ def analyze_email_with_ai(email_text):
         )
         vision_result = _vision_risk_for_capture(capture)
 
-        combined_url_risk = min(1.0, 0.6 * base_risk + 0.4 * vision_result["vision_risk"])
+        combined_url_risk = min(1.0, 0.3 * base_risk + 0.7 * vision_result["vision_risk"])
         url_risk_scores.append(combined_url_risk)
         vision_risks.append(vision_result["vision_risk"])
 
