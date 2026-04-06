@@ -21,6 +21,7 @@ from sklearn.metrics import precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 from transformers import (
     AutoTokenizer,
     AutoModel,
@@ -41,6 +42,7 @@ LEGACY_EMAIL_DATASETS = [
     "phishing_email_datasets/ling_phishing_and_legitimate_email_dataset.csv",
     "phishing_email_datasets/spam_assassin_phishing_and_legitimate_email_dataset.csv",
 ]
+URL_UNIFIED_DATASET = "url_datasets/unified_phishing&legitimate_url_dataset.csv"
 URL_DATASETS = [
     "phishing_url_datasets/kaggle_phishing_and_legitimate_url_dataset.csv",
     "phishing_url_datasets/mendeley_phishing_url_dataset.csv",
@@ -72,9 +74,13 @@ URL_COMPUTABLE_FEATURES = [
     "URLQueries_variable",
     "executable",
 ]
-IMAGE_DIR = "phishing_website_image_datasets/circl_phishing_website_imageset"
+IMAGE_DIRS = [
+    "image_datasets",
+    "phishing_website_image_datasets/circl_phishing_website_imageset",
+]
 VISION_PHISHING_SUBDIRS = ["phishing", "malicious", "fake"]
 VISION_LEGIT_SUBDIRS = ["legitimate", "benign", "safe"]
+VISION_IMAGE_EXTENSIONS = ("*.png", "*.jpg", "*.jpeg", "*.webp")
 
 MODELS_DIR = Path("trained_models")
 MODELS_DIR.mkdir(exist_ok=True)
@@ -171,6 +177,26 @@ class TrainingProgressCallback(TrainerCallback):
         return control
 
 
+class WeightedLossTrainer(Trainer):
+    """Custom Trainer that applies class weights to the loss."""
+    def __init__(self, class_weights=None, **kwargs):
+        super().__init__(**kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        
+        if self.class_weights is not None:
+            loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(self.class_weights, dtype=torch.float32, device=logits.device))
+        else:
+            loss_fn = nn.CrossEntropyLoss()
+        
+        loss = loss_fn(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+
 def get_latest_checkpoint(checkpoint_root):
     """Return latest Hugging Face checkpoint dir (checkpoint-*) or None."""
     checkpoint_root = Path(checkpoint_root)
@@ -246,11 +272,56 @@ def load_email_datasets():
     return combined_df
 
 
-def load_url_datasets():
-    """Load and combine all URL datasets."""
+def load_url_datasets(use_full_url_data=False):
+    """Load URL datasets with priority for unified dataset.
+
+    Args:
+        use_full_url_data: When True, train on all available URL rows.
+            When False (default), cap very large datasets for faster iteration.
+    """
     print("\nLoading URL datasets...")
 
-    # Prefer new precomputed feature dataset when available.
+    # First priority: Use the unified dataset (body=URL, type=label)
+    unified_path = DATASET_DIR / URL_UNIFIED_DATASET
+    if unified_path.exists():
+        try:
+            df = pd.read_csv(unified_path, low_memory=False, encoding="utf-8-sig")
+            df.columns = [str(c).strip().lower().lstrip("\ufeff") for c in df.columns]
+            
+            if "body" not in df.columns or "type" not in df.columns:
+                raise ValueError("Unified dataset must have 'body' and 'type' columns")
+            
+            # Rename body to url, type to label. Labels are already correct: 1=phishing, 0=legitimate
+            df = df[["body", "type"]].rename(columns={"body": "url", "type": "label"})
+            df["label"] = pd.to_numeric(df["label"], errors="coerce").fillna(0).astype(int)
+            df = df.dropna(subset=["url", "label"])
+            df["url"] = df["url"].astype(str).str.strip()
+            df = df[df["url"].str.len() > 0]  # Remove empty URLs
+            
+            # Remove duplicates
+            df = df.drop_duplicates(subset=["url"])
+            
+            print(f"  [OK] Using unified URL dataset: {URL_UNIFIED_DATASET}")
+            print(f"Total unique URLs: {len(df)}")
+            print(f"  Phishing (1): {(df['label'] == 1).sum()}")
+            print(f"  Legitimate (0): {(df['label'] == 0).sum()}")
+            
+            # Optional sampling for faster training iterations.
+            max_urls = 100000
+            if not use_full_url_data and len(df) > max_urls:
+                df = df.groupby('label', group_keys=False).apply(
+                    lambda x: x.sample(n=min(len(x), max_urls // 2), random_state=42)
+                )
+                print(f"  Sampled to: {len(df)} URLs for efficient training")
+            elif use_full_url_data:
+                print("  [OK] Using full URL dataset (sampling disabled)")
+            
+            return df
+        except Exception as e:
+            print(f"  [WARN] Could not use unified URL dataset ({URL_UNIFIED_DATASET}): {e}")
+            print("  [WARN] Falling back to legacy datasets...")
+
+    # Second priority: precomputed feature dataset
     feature_path = DATASET_DIR / URL_FEATURE_DATASET
     if feature_path.exists():
         try:
@@ -295,8 +366,9 @@ def load_url_datasets():
             return feature_df
         except Exception as e:
             print(f"  [WARN] Could not use feature URL dataset ({URL_FEATURE_DATASET}): {e}")
-            print("  [WARN] Falling back to legacy URL datasets")
 
+    # Third priority: Legacy datasets
+    print("  [WARN] Falling back to legacy URL datasets...")
     dfs = []
     for url_file in URL_DATASETS:
         path = DATASET_DIR / url_file
@@ -304,14 +376,13 @@ def load_url_datasets():
             try:
                 df = pd.read_csv(path, dtype={"url": str, "type": int})
                 df.columns = ["url", "label"]
-                df["label"] = 1 - df["label"]
                 dfs.append(df)
                 print(f"  [OK] {url_file}: {len(df)} samples")
             except Exception as e:
                 print(f"  [ERROR] {url_file}: {e}")
     
     if not dfs:
-        raise ValueError("No URL datasets loaded!")
+        raise ValueError("No URL datasets found! Expected unified_phishing&legitimate_url_dataset.csv in datasets/url_datasets/")
     
     combined_df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["url"])
     print(f"Total unique URLs: {len(combined_df)}")
@@ -330,48 +401,61 @@ def load_image_dataset():
     """Load website screenshots for vision fine-tuning.
 
     Preferred layout:
-    datasets/.../circl_phishing_website_imageset/
+    datasets/image_datasets/
       phishing/*.png
       legitimate/*.png
     """
     print("\nLoading website images...")
-    image_path = DATASET_DIR / IMAGE_DIR
-    if not image_path.exists():
-        print(f"  [ERROR] Image directory not found: {image_path}")
+    candidate_roots = [DATASET_DIR / rel_path for rel_path in IMAGE_DIRS]
+    image_root = next((path for path in candidate_roots if path.exists()), None)
+
+    if image_root is None:
+        print("  [ERROR] No image dataset directory found")
+        for path in candidate_roots:
+            print(f"  [HINT] Looked for: {path}")
         return [], []
 
     image_paths = []
     labels = []
 
+    def collect_images(folder, label):
+        collected = []
+        for pattern in VISION_IMAGE_EXTENSIONS:
+            collected.extend(sorted(glob.glob(str(folder / pattern))))
+        image_paths.extend(collected)
+        labels.extend([label] * len(collected))
+        return len(collected)
+
     # Preferred: class subfolders for phishing(1) and legitimate(0).
+    phishing_count = 0
+    legit_count = 0
     for subdir in VISION_PHISHING_SUBDIRS:
-        sub_path = image_path / subdir
+        sub_path = image_root / subdir
         if sub_path.exists() and sub_path.is_dir():
-            pngs = sorted(glob.glob(str(sub_path / "*.png")))
-            image_paths.extend(pngs)
-            labels.extend([1] * len(pngs))
+            phishing_count += collect_images(sub_path, 1)
 
     for subdir in VISION_LEGIT_SUBDIRS:
-        sub_path = image_path / subdir
+        sub_path = image_root / subdir
         if sub_path.exists() and sub_path.is_dir():
-            pngs = sorted(glob.glob(str(sub_path / "*.png")))
-            image_paths.extend(pngs)
-            labels.extend([0] * len(pngs))
+            legit_count += collect_images(sub_path, 0)
 
     if image_paths:
-        print(f"  [OK] Labeled PNG images found: {len(image_paths)}")
-        print(f"  Phishing (1): {sum(1 for y in labels if y == 1)}")
-        print(f"  Legitimate (0): {sum(1 for y in labels if y == 0)}")
+        print(f"  [OK] Using image dataset: {image_root}")
+        print(f"  Images found: {len(image_paths)}")
+        print(f"  Phishing (1): {phishing_count}")
+        print(f"  Legitimate (0): {legit_count}")
         return image_paths, labels
 
-    # Backward compatibility: root-level PNGs exist but no labels.
-    root_pngs = sorted(glob.glob(str(image_path / "*.png")))
-    if root_pngs:
-        print(f"  [WARN] Found {len(root_pngs)} root PNGs but no class subfolders.")
-        print("  [WARN] Vision training requires both phishing and legitimate labeled folders.")
-        return root_pngs, [1] * len(root_pngs)
+    # Backward compatibility: root-level images exist but no class folders.
+    root_images = []
+    for pattern in VISION_IMAGE_EXTENSIONS:
+        root_images.extend(sorted(glob.glob(str(image_root / pattern))))
+    if root_images:
+        print(f"  [WARN] Found {len(root_images)} root images but no class subfolders.")
+        print("  [WARN] Vision training requires labeled phishing/ and legitimate/ folders.")
+        return root_images, [1] * len(root_images)
 
-    print("  [ERROR] No PNG images found")
+    print("  [ERROR] No supported image files found")
     return [], []
 
 
@@ -572,16 +656,32 @@ def train_url_classifier(df_urls):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, image_paths, labels, processor):
+    def __init__(self, image_paths, labels, processor, augment=False):
         self.image_paths = image_paths
         self.labels = labels
         self.processor = processor
+        self.augment = augment
+        
+        # Data augmentation transforms for training
+        self.augmentation = transforms.Compose([
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.3),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        ])
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
         image = Image.open(self.image_paths[idx]).convert("RGB")
+        
+        # Apply augmentation only during training
+        if self.augment:
+            image = self.augmentation(image)
+        
         processed = self.processor(images=image, return_tensors="pt")
         
         return {
@@ -646,28 +746,44 @@ def train_vision_classifier(image_paths, labels):
         valid_paths, valid_labels, test_size=0.2, random_state=42, stratify=valid_labels
     )
     
-    train_dataset = ImageDataset(paths_train, labels_train, processor)
-    test_dataset = ImageDataset(paths_test, labels_test, processor)
+    # Calculate class weights to handle imbalance
+    unique_labels, counts = np.unique(labels_train, return_counts=True)
+    class_weights = len(labels_train) / (len(unique_labels) * counts)
+    class_weights = class_weights / class_weights.sum() * len(class_weights)  # Normalize
+    print(f"  Class weights: {class_weights}")
+    print(f"    Legitimate (0): {class_weights[0]:.4f}")
+    print(f"    Phishing (1): {class_weights[1]:.4f}")
+    
+    # Create datasets with augmentation for training, no augmentation for test
+    train_dataset = ImageDataset(paths_train, labels_train, processor, augment=True)
+    test_dataset = ImageDataset(paths_test, labels_test, processor, augment=False)
+    
+    # Adaptive batch size based on dataset size
+    batch_size = 4 if len(paths_train) < 500 else 8
+    max_steps = max(30, len(paths_train) // (batch_size * 2))  # At least 2 epochs worth
     
     training_args = TrainingArguments(
         output_dir=str(MODELS_DIR / "mobilenet_vision_checkpoint"),
         num_train_epochs=5,
-        max_steps=30,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        save_steps=5,
-        eval_steps=5,
-        logging_steps=2,
+        max_steps=max_steps,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size * 2,
+        save_steps=max(5, max_steps // 10),  # Save 10 checkpoints
+        eval_steps=max(5, max_steps // 10),
+        logging_steps=max(1, max_steps // 50),  # Log 50 times during training
         eval_strategy="steps",
         save_strategy="steps",
         load_best_model_at_end=True,
+        warmup_steps=0,
+        weight_decay=0.01,
     )
     
-    trainer = Trainer(
+    trainer = WeightedLossTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
+        class_weights=class_weights,
         callbacks=[TrainingProgressCallback("vision")],
     )
 
@@ -703,9 +819,19 @@ def main():
         help="Retrain BERT even if an existing trained model is found.",
     )
     parser.add_argument(
+        "--skip-bert",
+        action="store_true",
+        help="Skip BERT training and train only URL + vision models.",
+    )
+    parser.add_argument(
         "--force-url-retrain",
         action="store_true",
         help="Retrain URL classifier even if an existing model is found.",
+    )
+    parser.add_argument(
+        "--use-full-url-data",
+        action="store_true",
+        help="Use the full URL CSV without sampling to 100k rows.",
     )
     args = parser.parse_args()
 
@@ -714,17 +840,21 @@ def main():
     print("PHISHING DETECTOR - COMPREHENSIVE MODEL TRAINING PIPELINE")
     print("="*70)
 
-    bert_output_exists = (MODELS_DIR / "bert_email_classifier").exists() and not args.force_bert_retrain
+    bert_output_exists = args.skip_bert or ((MODELS_DIR / "bert_email_classifier").exists() and not args.force_bert_retrain)
     url_output_exists = (MODELS_DIR / "url_classifier.pkl").exists() and not args.force_url_retrain
 
     df_emails = load_email_datasets() if not bert_output_exists else None
-    df_urls = load_url_datasets() if not url_output_exists else None
+    df_urls = load_url_datasets(use_full_url_data=args.use_full_url_data) if not url_output_exists else None
     image_paths, image_labels = load_image_dataset()
     
     try:
         if bert_output_exists:
-            print("[OK] Skipping BERT training (existing model found)")
-            set_phase_progress("bert", status="completed", percent=100.0, detail="Skipped (already trained)")
+            if args.skip_bert:
+                print("[OK] Skipping BERT training (--skip-bert enabled)")
+                set_phase_progress("bert", status="completed", percent=100.0, detail="Skipped by flag")
+            else:
+                print("[OK] Skipping BERT training (existing model found)")
+                set_phase_progress("bert", status="completed", percent=100.0, detail="Skipped (already trained)")
             bert_model, bert_tokenizer = None, None
         else:
             bert_model, bert_tokenizer = train_email_classifier(

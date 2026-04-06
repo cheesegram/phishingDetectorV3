@@ -111,6 +111,47 @@ _mobilenet_bundle = None
 _url_model_bundle = None
 
 
+def _clamp01(value):
+    return max(0.0, min(1.0, float(value)))
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _safe_logit(p):
+    p = _clamp01(p)
+    p = min(1.0 - 1e-6, max(1e-6, p))
+    return math.log(p / (1.0 - p))
+
+
+def _stacked_fused_risk(nlp_risk, vision_risk, has_successful_vision):
+    """Logistic-regression style stacking of NLP and Vision risks.
+
+    Coefficients are calibrated heuristics (not fit from labels yet), designed to
+    amplify confidence when NLP and vision are both high.
+    """
+    nlp_risk = _clamp01(nlp_risk)
+    vision_risk = _clamp01(vision_risk)
+
+    x_nlp = _safe_logit(nlp_risk)
+
+    if has_successful_vision:
+        x_vision = _safe_logit(vision_risk)
+        interaction = nlp_risk * vision_risk
+        z = (
+            -0.40
+            + 1.20 * x_nlp
+            + 1.00 * x_vision
+            + 1.20 * interaction
+        )
+    else:
+        # If no successful screenshots, fall back to NLP-only stacked estimate.
+        z = -0.45 + 1.30 * x_nlp
+
+    return _clamp01(_sigmoid(z))
+
+
 def _shannon_entropy(text):
     if not text:
         return 0.0
@@ -527,11 +568,23 @@ def _capture_screenshots(urls, output_dir, max_urls=None):
                 except Exception:
                     retry_note = "Retry after blank capture failed"
 
+            page_text_hint = ""
+            try:
+                page_text_hint = (
+                    driver.execute_script(
+                        "return (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : '';"
+                    )
+                    or ""
+                )
+            except Exception:
+                page_text_hint = ""
+
             captures.append(
                 {
                     "url": url,
                     "screenshot_path": shot_path,
                     "page_title": (driver.title or "").strip(),
+                    "page_text_hint": str(page_text_hint).strip(),
                     "error": retry_note,
                 }
             )
@@ -577,6 +630,28 @@ def _vision_risk_for_capture(capture):
         }
 
     image = Image.open(capture["screenshot_path"]).convert("RGB")
+
+    title_text = str(capture.get("page_title", "") or "").lower()
+    error_text = str(capture.get("error", "") or "").lower()
+    page_text_hint = str(capture.get("page_text_hint", "") or "").lower()
+    combined_text = f"{title_text} {error_text} {page_text_hint}"
+
+    warning_markers = [
+        "your connection is not private",
+        "privacy error",
+        "net::err_cert",
+        "cert_common_name_invalid",
+        "err_ssl",
+        "certificate",
+        "back to safety",
+    ]
+    if any(marker in combined_text for marker in warning_markers):
+        return {
+            "vision_risk": 1.0,
+            "vision_label": "SSL/Privacy warning interstitial",
+            "vision_confidence": 100.0,
+            "vision_notes": "Browser certificate/privacy warning detected",
+        }
 
     if bundle is not None and torch is not None and F is not None:
         with torch.no_grad():
@@ -643,19 +718,24 @@ def _calc_vision_similarity(captures):
 
 
 def _risk_band(score):
-    if score >= 60:
-        return "High Risk", "#ff4b4b"
-    if score >= 40:
-        return "Medium Risk", "#ffd43b"
-    return "Low Risk", "#00ff00"
+    if score > 50:
+        return "DANGER", "#ff4b4b"
+    if score >= 25:
+        return "SUSPICIOUS", "#ffd43b"
+    return "SAFE", "#00ff00"
 
 
 def _classify_email(risk_score, nlp_risk):
-    if risk_score >= 60:
-        return "PHISHING ATTEMPT"
-    if risk_score >= 30:
-        return "SUSPICIOUS EMAIL"
-    return "LEGITIMATE EMAIL"
+    if risk_score > 50:
+        return "DANGER"
+    if risk_score >= 25:
+        return "SUSPICIOUS"
+    return "SAFE"
+
+
+def _assessment_from_percent(score_percent):
+    label, _ = _risk_band(float(score_percent))
+    return label
 
 
 def _generate_nlp_findings(nlp_risk, keyword_hits, url_risk_score):
@@ -709,7 +789,7 @@ def analyze_email_with_ai(email_text):
         url_risk_scores.append(combined_url_risk)
         vision_risks.append(vision_result["vision_risk"])
 
-        status = "DANGER" if combined_url_risk >= 0.75 else ("UNSAFE" if combined_url_risk >= 0.55 else "SAFE")
+        status = "DANGER" if combined_url_risk > 0.50 else ("SUSPICIOUS" if combined_url_risk >= 0.25 else "SAFE")
         short_url = url if len(url) <= 72 else f"{url[:69]}..."
         full_url = url
 
@@ -718,8 +798,10 @@ def analyze_email_with_ai(email_text):
                 "url": short_url,
                 "full_url": full_url,
                 "status": status,
+                "url_risk_score": round(combined_url_risk * 100, 2),
                 "screenshot_path": capture["screenshot_path"],
                 "page_title": capture["page_title"],
+                "vision_risk_score": round(vision_result["vision_risk"] * 100, 2),
                 "vision_label": vision_result["vision_label"],
                 "vision_confidence": vision_result["vision_confidence"],
                 "vision_notes": vision_result["vision_notes"],
@@ -734,20 +816,19 @@ def analyze_email_with_ai(email_text):
     # Check if vision data is actually available (successful captures).
     has_successful_vision = any(cap.get("screenshot_path") and os.path.exists(cap.get("screenshot_path")) for cap in captures)
     
-    # Final risk is primarily NLP + vision; when both agree at high levels, boost confidence.
-    if has_successful_vision:
-        # Use both NLP and vision when vision data exists.
-        base_combined = 0.55 * nlp_risk + 0.45 * avg_vision_risk
-        agreement = 1.0 - abs(nlp_risk - avg_vision_risk)
-        intensity = 0.5 * (nlp_risk + avg_vision_risk)
-        confidence_boost = 0.12 * agreement * intensity
-        unified_risk = min(1.0, base_combined + confidence_boost)
-    else:
-        # No vision data: use NLP risk directly.
-        unified_risk = nlp_risk
+    # Logistic-regression style stacking across model outputs.
+    unified_risk = _stacked_fused_risk(
+        nlp_risk=nlp_risk,
+        vision_risk=avg_vision_risk,
+        has_successful_vision=has_successful_vision,
+    )
     
     risk_score = int(round(unified_risk * 100))
-    risk_score = min(98, max(1, risk_score))
+    risk_score = min(100, max(0, risk_score))
+
+    bert_nlp_score = round(bert_prob * 100, 2)
+    url_analyzer_score = round(avg_url_risk * 100, 2)
+    mobilenet_vision_score = round(avg_vision_risk * 100, 2)
 
     classification = _classify_email(risk_score, nlp_risk)
     nlp_findings = _generate_nlp_findings(nlp_risk, keyword_hits, url_structure_risk_score)
@@ -759,11 +840,27 @@ def analyze_email_with_ai(email_text):
         "risk_level": risk_level,
         "color": color,
         "classification": classification,
+        "stacked_scores": {
+            "bert_nlp_risk_score": bert_nlp_score,
+            "mobilenet_vision_risk_score": mobilenet_vision_score,
+            "url_analyzer_risk_score": url_analyzer_score,
+            "fused_risk_score": risk_score,
+        },
+        "nlp_summary": {
+            "bert_nlp_risk_score": bert_nlp_score,
+            "assessment": _assessment_from_percent(bert_nlp_score),
+        },
+        "url_summary": {
+            "url_analyzer_risk_score": url_analyzer_score,
+            "assessment": _assessment_from_percent(url_analyzer_score),
+            "checked_urls": len(urls),
+        },
         "nlp_findings": nlp_findings,
         "extracted_urls": url_objects,
         "has_vision_data": has_successful_vision,
         "vision_summary": {
-            "avg_vision_risk": round(avg_vision_risk * 100, 2),
+            "avg_vision_risk": mobilenet_vision_score,
+            "assessment": _assessment_from_percent(mobilenet_vision_score),
             "checked_urls": len(captures),
             "similarity": vision_similarity,
         },
@@ -773,10 +870,25 @@ def analyze_email_with_ai(email_text):
 def default_safe():
     return {
         "risk_score": 0,
-        "risk_level": "Safe",
+        "risk_level": "SAFE",
         "color": "#00ff00",
-        "classification": "LEGITIMATE EMAIL",
+        "classification": "SAFE",
+        "stacked_scores": {
+            "bert_nlp_risk_score": 0.0,
+            "mobilenet_vision_risk_score": 0.0,
+            "url_analyzer_risk_score": 0.0,
+            "fused_risk_score": 0,
+        },
+        "nlp_summary": {
+            "bert_nlp_risk_score": 0.0,
+            "assessment": "SAFE",
+        },
+        "url_summary": {
+            "url_analyzer_risk_score": 0.0,
+            "assessment": "SAFE",
+            "checked_urls": 0,
+        },
         "nlp_findings": ["Normal E-mail language patterns"],
         "extracted_urls": [],
-        "vision_summary": {"avg_vision_risk": 0.0, "checked_urls": 0, "similarity": 100},
+        "vision_summary": {"avg_vision_risk": 0.0, "assessment": "SAFE", "checked_urls": 0, "similarity": 100},
     }
